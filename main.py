@@ -1,6 +1,8 @@
+
 import os
 import sqlite3
 import threading
+
 from flask import Flask
 from dotenv import load_dotenv
 
@@ -24,9 +26,9 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = 8286503966
 DB_FILE = "bot.db"
+TRAINING_COST = 30
 
 app_web = Flask(__name__)
-
 ADMIN_STATE = {}
 
 
@@ -49,8 +51,6 @@ def init_db():
         )
     """)
 
-    # اگر جدول قدیمی custom_buttons وجود داشته باشد،
-    # فقط همان نسخه قدیمی را یک بار حذف می‌کنیم.
     cur.execute("PRAGMA table_info(custom_buttons)")
     cols = [row[1] for row in cur.fetchall()]
 
@@ -96,7 +96,12 @@ def get_points(user_id):
 
     con = db()
     cur = con.cursor()
-    cur.execute("SELECT points FROM users WHERE user_id=?", (user_id,))
+
+    cur.execute(
+        "SELECT points FROM users WHERE user_id=?",
+        (user_id,)
+    )
+
     row = cur.fetchone()
     con.close()
 
@@ -116,6 +121,26 @@ def add_points(user_id, amount):
 
     con.commit()
     con.close()
+
+
+def deduct_points(user_id, amount):
+    ensure_user(user_id)
+
+    con = db()
+    cur = con.cursor()
+
+    cur.execute(
+        "UPDATE users SET points = points - ? "
+        "WHERE user_id = ? AND points >= ?",
+        (amount, user_id, amount)
+    )
+
+    success = cur.rowcount == 1
+
+    con.commit()
+    con.close()
+
+    return success
 
 
 # =========================
@@ -179,8 +204,10 @@ def create_button(name):
             "INSERT INTO custom_buttons(button_name) VALUES (?)",
             (name,)
         )
+
         con.commit()
         button_id = cur.lastrowid
+
     except sqlite3.IntegrityError:
         button_id = None
 
@@ -238,18 +265,11 @@ def save_content(button_id, content_type, content):
 
 def main_keyboard(user_id):
     rows = [
-        [
-            "💎 موجودی من",
-            "💰 خرید موجودی"
-        ],
-        [
-            "📞 پشتیبانی",
-            "📋 راهنما"
-        ]
+        ["💎 موجودی من", "💰 خرید موجودی"],
+        ["📞 پشتیبانی", "📋 راهنما"],
     ]
 
     buttons = get_buttons()
-
     dynamic_row = []
 
     for _, name in buttons:
@@ -273,21 +293,11 @@ def main_keyboard(user_id):
 
 def admin_keyboard():
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("➕ ساخت دکمه", callback_data="create_btn")
-        ],
-        [
-            InlineKeyboardButton("📦 افزودن محتوا", callback_data="add_content")
-        ],
-        [
-            InlineKeyboardButton("🗑 حذف دکمه", callback_data="delete_btn")
-        ],
-        [
-            InlineKeyboardButton("🗑 حذف یک محتوا", callback_data="delete_content")
-        ],
-        [
-            InlineKeyboardButton("📋 لیست دکمه‌ها", callback_data="list_buttons")
-        ],
+        [InlineKeyboardButton("➕ ساخت دکمه", callback_data="create_btn")],
+        [InlineKeyboardButton("📦 افزودن محتوا", callback_data="add_content")],
+        [InlineKeyboardButton("🗑 حذف دکمه", callback_data="delete_btn")],
+        [InlineKeyboardButton("🗑 حذف یک محتوا", callback_data="delete_content")],
+        [InlineKeyboardButton("📋 لیست دکمه‌ها", callback_data="list_buttons")],
     ])
 
 
@@ -362,8 +372,13 @@ async def send_content(update, context, content_type, content):
             voice=content
         )
 
+    else:
+        raise ValueError("Unsupported content type")
+
 
 async def send_button_contents(update, context, button_id):
+    user_id = update.effective_user.id
+
     contents = get_button_contents(button_id)
 
     if not contents:
@@ -371,6 +386,23 @@ async def send_button_contents(update, context, button_id):
             "⚠️ هنوز محتوایی برای این دکمه ثبت نشده."
         )
         return
+
+    # ادمین رایگان به آموزش‌ها دسترسی دارد.
+    is_admin = user_id == ADMIN_ID
+
+    if not is_admin:
+        if not deduct_points(user_id, TRAINING_COST):
+            points = get_points(user_id)
+
+            await update.message.reply_text(
+                "❌ موجودی شما کافی نیست!\n\n"
+                f"💎 موجودی فعلی: {points} امتیاز\n"
+                f"📚 هزینه آموزش: {TRAINING_COST} امتیاز\n\n"
+                "برای دریافت امتیاز از بخش خرید موجودی اقدام کنید."
+            )
+            return
+
+    sent_count = 0
 
     for _, content_type, content in contents:
         try:
@@ -380,8 +412,34 @@ async def send_button_contents(update, context, button_id):
                 content_type,
                 content
             )
+            sent_count += 1
+
         except Exception as e:
             print("CONTENT ERROR:", e)
+
+    if sent_count == 0:
+        if not is_admin:
+            add_points(user_id, TRAINING_COST)
+
+        await update.message.reply_text(
+            "⚠️ ارسال آموزش ناموفق بود."
+            + (
+                "\nامتیاز شما برگشت داده شد."
+                if not is_admin else ""
+            )
+        )
+        return
+
+    if is_admin:
+        await update.message.reply_text(
+            "✅ آموزش برای ادمین ارسال شد."
+        )
+    else:
+        await update.message.reply_text(
+            "✅ آموزش ارسال شد.\n"
+            f"💎 {TRAINING_COST} امتیاز کم شد.\n"
+            f"💰 موجودی باقی‌مانده: {get_points(user_id)} امتیاز"
+        )
 
 
 # =========================
@@ -420,7 +478,8 @@ async def guide(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📋 راهنما\n\n"
         "از دکمه‌های منوی اصلی استفاده کنید.\n"
-        "محتواهای آموزشی داخل دکمه‌های مربوطه قرار می‌گیرند."
+        "محتواهای آموزشی داخل دکمه‌های مربوطه قرار می‌گیرند.\n"
+        f"💎 هزینه هر آموزش: {TRAINING_COST} امتیاز"
     )
 
 
@@ -530,6 +589,9 @@ async def create_button_callback(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     await query.answer()
 
+    if query.from_user.id != ADMIN_ID:
+        return
+
     ADMIN_STATE[ADMIN_ID] = {
         "state": "button_name"
     }
@@ -546,6 +608,9 @@ async def create_button_callback(update: Update, context: ContextTypes.DEFAULT_T
 async def add_content_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
+    if query.from_user.id != ADMIN_ID:
+        return
 
     buttons = get_buttons()
 
@@ -575,6 +640,9 @@ async def choose_add_content(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
 
+    if query.from_user.id != ADMIN_ID:
+        return
+
     button_id = int(query.data.replace("addcontent_", ""))
 
     ADMIN_STATE[ADMIN_ID] = {
@@ -595,6 +663,9 @@ async def choose_add_content(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def delete_button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
+    if query.from_user.id != ADMIN_ID:
+        return
 
     buttons = get_buttons()
 
@@ -624,8 +695,10 @@ async def delete_button_confirm(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
 
-    button_id = int(query.data.replace("delbtn_", ""))
+    if query.from_user.id != ADMIN_ID:
+        return
 
+    button_id = int(query.data.replace("delbtn_", ""))
     delete_button(button_id)
 
     await query.message.reply_text(
@@ -640,6 +713,9 @@ async def delete_button_confirm(update: Update, context: ContextTypes.DEFAULT_TY
 async def delete_content_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
+    if query.from_user.id != ADMIN_ID:
+        return
 
     buttons = get_buttons()
 
@@ -669,8 +745,10 @@ async def show_contents_for_delete(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     await query.answer()
 
-    button_id = int(query.data.replace("delcontent_", ""))
+    if query.from_user.id != ADMIN_ID:
+        return
 
+    button_id = int(query.data.replace("delcontent_", ""))
     contents = get_button_contents(button_id)
 
     if not contents:
@@ -685,7 +763,7 @@ async def show_contents_for_delete(update: Update, context: ContextTypes.DEFAULT
         if content_type == "text":
             title = content[:30]
         else:
-            title = f"{content_type}"
+            title = content_type
 
         keyboard.append([
             InlineKeyboardButton(
@@ -704,8 +782,10 @@ async def delete_one_content(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
 
-    content_id = int(query.data.replace("delone_", ""))
+    if query.from_user.id != ADMIN_ID:
+        return
 
+    content_id = int(query.data.replace("delone_", ""))
     delete_content(content_id)
 
     await query.message.reply_text(
@@ -720,6 +800,9 @@ async def delete_one_content(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def list_buttons_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
+    if query.from_user.id != ADMIN_ID:
+        return
 
     buttons = get_buttons()
 
@@ -759,11 +842,13 @@ async def handle_admin_state(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     state = state_data["state"]
 
-    # -------------------------
-    # BUTTON NAME
-    # -------------------------
-
     if state == "button_name":
+        if not update.message.text:
+            await update.message.reply_text(
+                "❌ لطفاً اسم دکمه را به‌صورت متن بفرست."
+            )
+            return True
+
         name = update.message.text.strip()
 
         if not name:
@@ -793,11 +878,7 @@ async def handle_admin_state(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         return True
 
-    # -------------------------
-    # FIRST CONTENT
-    # -------------------------
-
-    if state == "button_content":
+    if state in ("button_content", "add_content"):
         content_type, content = extract_content(update)
 
         if not content_type:
@@ -814,37 +895,15 @@ async def handle_admin_state(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         ADMIN_STATE.pop(user_id, None)
 
-        await update.message.reply_text(
-            "✅ محتوا با موفقیت اضافه شد.\n\n"
-            "📌 از پنل می‌توانی محتواهای بیشتری به همین دکمه اضافه کنی."
-        )
-
-        return True
-
-    # -------------------------
-    # ADD CONTENT
-    # -------------------------
-
-    if state == "add_content":
-        content_type, content = extract_content(update)
-
-        if not content_type:
+        if state == "button_content":
             await update.message.reply_text(
-                "❌ این نوع محتوا پشتیبانی نمی‌شود."
+                "✅ محتوا با موفقیت اضافه شد.\n\n"
+                "📌 از پنل می‌توانی محتواهای بیشتری به همین دکمه اضافه کنی."
             )
-            return True
-
-        save_content(
-            state_data["button_id"],
-            content_type,
-            content
-        )
-
-        ADMIN_STATE.pop(user_id, None)
-
-        await update.message.reply_text(
-            "✅ محتوا به دکمه اضافه شد."
-        )
+        else:
+            await update.message.reply_text(
+                "✅ محتوا به دکمه اضافه شد."
+            )
 
         return True
 
@@ -883,12 +942,17 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await admin_panel(update, context)
         return
 
+    if text is None:
+        return
+
     button = get_button_by_name(text)
 
     if button:
-        button_id = button[0]
-        await send_button_contents(update, context, button_id)
-        return
+        await send_button_contents(
+            update,
+            context,
+            button[0]
+        )
 
 
 # =========================
@@ -908,9 +972,16 @@ async def addpoints_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user_id = int(context.args[0])
         amount = int(context.args[1])
+
     except ValueError:
         await update.message.reply_text(
             "❌ مقدار واردشده صحیح نیست."
+        )
+        return
+
+    if amount <= 0:
+        await update.message.reply_text(
+            "❌ مقدار امتیاز باید بیشتر از صفر باشد."
         )
         return
 
@@ -937,6 +1008,7 @@ def health():
 
 def run_web():
     port = int(os.getenv("PORT", "10000"))
+
     app_web.run(
         host="0.0.0.0",
         port=port
@@ -949,7 +1021,9 @@ def run_web():
 
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN داخل .env پیدا نشد.")
+        raise RuntimeError(
+            "BOT_TOKEN داخل Environment پیدا نشد."
+        )
 
     init_db()
 
